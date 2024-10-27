@@ -267,11 +267,21 @@ int fork(void) {
   return pid;
 }
 
+// change state to string
+const char* state2str(int state) {
+  switch (state) {
+    case SLEEPING: return "SLEEPING";
+    case RUNNABLE: return "RUNNABLE";
+    case RUNNING: return "RUNNING";
+    default: return "unknown";
+  }
+}
+
 // Pass p's abandoned children to init.
 // Caller must hold p->lock.
 void reparent(struct proc *p) {
   struct proc *pp;
-
+  int i = 0;
   for (pp = proc; pp < &proc[NPROC]; pp++) {
     // this code uses pp->parent without holding pp->lock.
     // acquiring the lock first could cause a deadlock
@@ -282,11 +292,13 @@ void reparent(struct proc *p) {
       // because only the parent changes it, and we're the parent.
       acquire(&pp->lock);
       pp->parent = initproc;
+      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n", p->pid, i, pp->pid, pp->name, state2str(pp->state));
       // we should wake up init here, but that would require
       // initproc->lock, which would be a deadlock, since we hold
       // the lock on one of init's children (pp). this is why
       // exit() always wakes init (before acquiring any locks).
       release(&pp->lock);
+      i++;
     }
   }
 }
@@ -330,6 +342,8 @@ void exit(int status) {
   // as anything else.
   acquire(&p->lock);
   struct proc *original_parent = p->parent;
+  exit_info("proc %d exit, parent pid %d, name %s, state %s\n", 
+          p -> pid, original_parent -> pid, original_parent -> name, state2str(original_parent -> state));
   release(&p->lock);
 
   // we need the parent's lock in order to wake it up from wait().
@@ -356,7 +370,7 @@ void exit(int status) {
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
-int wait(uint64 addr) {
+int wait(uint64 addr, uint64 flag) {
   struct proc *np;
   int havekids, pid;
   struct proc *p = myproc();
@@ -400,8 +414,16 @@ int wait(uint64 addr) {
       return -1;
     }
 
-    // Wait for a child to exit.
-    sleep(p, &p->lock);  // DOC: wait-sleep
+    if(flag==1)
+    {
+      release(&p->lock);
+      return -1;
+    }
+    else
+    {
+      // Wait for a child to exit.
+      sleep(p, &p->lock);  // DOC: wait-sleep
+    }
   }
 }
 

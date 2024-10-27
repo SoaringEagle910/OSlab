@@ -21,7 +21,9 @@ uint64 sys_fork(void) { return fork(); }
 uint64 sys_wait(void) {
   uint64 p;
   if (argaddr(0, &p) < 0) return -1;
-  return wait(p);
+  uint64 flag;
+  if(argaddr(1, &flag)<0)return -1;
+  return wait(p, flag);
 }
 
 uint64 sys_sbrk(void) {
@@ -79,5 +81,29 @@ uint64 sys_rename(void) {
   struct proc *p = myproc();
   memmove(p->name, name, len);
   p->name[len] = '\0';
+  return 0;
+}
+
+uint64 sys_yield(void)
+{
+  struct proc *curproc = myproc(); // 获取当前进程
+  struct trapframe *tf = curproc->trapframe; // 获取当前进程的trapframe
+  printf("Save the context of the process to the memory region from address %p to %p\n", &curproc->context, &curproc->context+1);
+  // 打印当前进程的pid和用户态pc值
+  printf("Current running process pid is %d and user pc is %p\n", curproc->pid, tf->epc);
+  // 查找下一个可运行的进程
+  struct proc *p;
+  for (p = proc; p < &proc[NPROC]; p++) {
+    if(p == curproc)continue;
+    acquire(&p->lock);
+    if (p->state == RUNNABLE) {
+      // p->state = RUNNING;
+      printf("Next runnable process pid is %d and user pc is %p\n", p->pid, p->trapframe->epc);
+      release(&p->lock);
+      break;
+    }
+    release(&p->lock);
+  }
+  yield();
   return 0;
 }

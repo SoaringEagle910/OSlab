@@ -46,6 +46,7 @@ findslot(struct spinlock *lk) {
 void
 initlock(struct spinlock *lk, char *name)
 {
+  // printf("%s\n", name);
   lk->name = name;
   lk->locked = 0;
   lk->cpu = 0;

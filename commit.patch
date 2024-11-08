@@ -1,0 +1,329 @@
+diff --git a/.gitignore b/.gitignore
+index 29b599f..bfc6894 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -25,3 +25,4 @@ barrier
+ compile_commands.json
+ .gdb_history
+ .cache/
++commit.patch
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index 6d33c99..d9a1c31 100644
+--- a/Makefile
++++ b/Makefile
+@@ -327,15 +327,8 @@ ping:
+ 	python3 ping.py $(FWDPORT)
+ endif
+ 
+-GDBARGS = 
+-GDBARGS += -ex 'set architecture riscv:rv64'
+-GDBARGS += -ex 'target remote 127.0.0.1:$(GDBPORT)'
+-GDBARGS += -ex 'symbol-file kernel/kernel'
+-GDBARGS += -ex 'set riscv use-compressed-breakpoints yes'
+-
+-
+ gdb: 
+-	$(GDB) $(GDBARGS)
++	$(GDB)
+ 
+ ##
+ ##  FOR testing lab grading script
+diff --git a/kernel/bio.c b/kernel/bio.c
+index 60d91a6..c1e3904 100644
+--- a/kernel/bio.c
++++ b/kernel/bio.c
+@@ -23,33 +23,43 @@
+ #include "fs.h"
+ #include "buf.h"
+ 
++#define NBUCKETS 13
+ struct {
+-  struct spinlock lock;
++  struct spinlock global_lock;
++  struct spinlock lock[NBUCKETS];
+   struct buf buf[NBUF];
+-
+   // Linked list of all buffers, through prev/next.
+-  // Sorted by how recently the buffer was used.
+-  // head.next is most recent, head.prev is least.
+-  struct buf head;
++  // head.next is most recently used.
++  //struct buf head;
++  struct buf hashbucket[NBUCKETS]; //每个哈希队列一个linked list及一个lock
+ } bcache;
+ 
+ void
+ binit(void)
+ {
++  // printf("binit start\n");
+   struct buf *b;
++  for(int i=0;i<NBUCKETS;i++)
++  {
++    // printf("i=%d\n",i);
++    initlock(&bcache.lock[i], "bcaches");
++    // printf("i=%d\n",i);
++
++    bcache.hashbucket[i].prev = &bcache.hashbucket[i];
++    bcache.hashbucket[i].next = &bcache.hashbucket[i];
++    
++  }
+ 
+-  initlock(&bcache.lock, "bcache");
+-
+-  // Create linked list of buffers
+-  bcache.head.prev = &bcache.head;
+-  bcache.head.next = &bcache.head;
+-  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
+-    b->next = bcache.head.next;
+-    b->prev = &bcache.head;
+-    initsleeplock(&b->lock, "buffer");
+-    bcache.head.next->prev = b;
+-    bcache.head.next = b;
++  for(b = bcache.buf; b < bcache.buf+NBUF; b++)
++  {
++
++    b->next = bcache.hashbucket[b->blockno%NBUCKETS].next;
++    b->prev = &bcache.hashbucket[b->blockno%NBUCKETS];
++    initsleeplock(&b->lock, "buffers");
++    bcache.hashbucket[b->blockno].next->prev = b;
++    bcache.hashbucket[b->blockno].next = b;
+   }
++
+ }
+ 
+ // Look through buffer cache for block on device dev.
+@@ -58,15 +68,18 @@ binit(void)
+ static struct buf*
+ bget(uint dev, uint blockno)
+ {
++  // printf("bget start\n");
+   struct buf *b;
+ 
+-  acquire(&bcache.lock);
++  int id = blockno % NBUCKETS;
++
++  acquire(&bcache.lock[id]);
+ 
+   // Is the block already cached?
+-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
++  for(b = bcache.hashbucket[id].next; b != &bcache.hashbucket[id]; b = b->next){
+     if(b->dev == dev && b->blockno == blockno){
+       b->refcnt++;
+-      release(&bcache.lock);
++      release(&bcache.lock[id]);
+       acquiresleep(&b->lock);
+       return b;
+     }
+@@ -74,17 +87,55 @@ bget(uint dev, uint blockno)
+ 
+   // Not cached.
+   // Recycle the least recently used (LRU) unused buffer.
+-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
++  for(b = bcache.hashbucket[id].prev; b != &bcache.hashbucket[id]; b = b->prev){
+     if(b->refcnt == 0) {
+       b->dev = dev;
+       b->blockno = blockno;
+       b->valid = 0;
+       b->refcnt = 1;
+-      release(&bcache.lock);
++      release(&bcache.lock[id]);
+       acquiresleep(&b->lock);
+       return b;
+     }
+   }
++  //rob from others
++  release(&bcache.lock[id]);
++  acquire(&bcache.global_lock);
++  acquire(&bcache.lock[id]);
++  // printf("hhh\n");
++  for(int i=0;i<NBUCKETS;i++)
++  {
++    if(i==id)continue;
++    acquire(&bcache.lock[i]);
++    for(b = bcache.hashbucket[i].prev; b!= &bcache.hashbucket[i]; b = b->prev)
++    {
++      if(b->refcnt == 0)
++      {
++        //link
++        //pre linkedlist
++        b->prev->next = b->next;
++        b->next->prev = b->prev;
++        //new linkedlist
++        b->next = bcache.hashbucket[id].next;
++        b->prev = &bcache.hashbucket[id];
++        bcache.hashbucket[id].next->prev = b;
++        bcache.hashbucket[id].next = b;
++
++        b->dev = dev;
++        b->blockno = blockno;
++        b->valid = 0;
++        b->refcnt = 1;
++        release(&bcache.lock[i]);
++        release(&bcache.lock[id]);
++        release(&bcache.global_lock);
++        acquiresleep(&b->lock);
++        return b;
++      }
++    }
++    release(&bcache.lock[i]);
++  }
++  release(&bcache.lock[id]);
++  release(&bcache.global_lock);
+   panic("bget: no buffers");
+ }
+ 
+@@ -116,38 +167,44 @@ bwrite(struct buf *b)
+ void
+ brelse(struct buf *b)
+ {
++  // printf("brelse start\n");
+   if(!holdingsleep(&b->lock))
+     panic("brelse");
+ 
+   releasesleep(&b->lock);
+ 
+-  acquire(&bcache.lock);
++  int id = b->blockno % NBUCKETS;
++  acquire(&bcache.lock[id]);
+   b->refcnt--;
+   if (b->refcnt == 0) {
+     // no one is waiting for it.
+     b->next->prev = b->prev;
+     b->prev->next = b->next;
+-    b->next = bcache.head.next;
+-    b->prev = &bcache.head;
+-    bcache.head.next->prev = b;
+-    bcache.head.next = b;
++    b->next = bcache.hashbucket[id].next;
++    b->prev = &bcache.hashbucket[id];
++    bcache.hashbucket[id].next->prev = b;
++    bcache.hashbucket[id].next = b;
+   }
+   
+-  release(&bcache.lock);
++  release(&bcache.lock[id]);
+ }
+ 
+ void
+ bpin(struct buf *b) {
+-  acquire(&bcache.lock);
++  // printf("bpin start\n");
++  int id = b->blockno % NBUCKETS;
++  acquire(&bcache.lock[id]);
+   b->refcnt++;
+-  release(&bcache.lock);
++  release(&bcache.lock[id]);
+ }
+ 
+ void
+ bunpin(struct buf *b) {
+-  acquire(&bcache.lock);
++  // printf("bunpin start\n");
++  int id = b->blockno % NBUCKETS;
++  acquire(&bcache.lock[id]);
+   b->refcnt--;
+-  release(&bcache.lock);
++  release(&bcache.lock[id]);
+ }
+ 
+ 
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index fa6a0ac..4a9c852 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -17,16 +17,20 @@ extern char end[]; // first address after kernel.
+ struct run {
+   struct run *next;
+ };
+-
+-struct {
++struct kmem{
+   struct spinlock lock;
+   struct run *freelist;
+-} kmem;
++};
++struct kmem kmems[NCPU];
+ 
+ void
+ kinit()
+ {
+-  initlock(&kmem.lock, "kmem");
++  for(int i=0;i<NCPU;i++)
++  {
++    initlock(&kmems[i].lock, "kmems");
++  }
++  // initlock(&kmem.lock, "kmem");
+   freerange(end, (void*)PHYSTOP);
+ }
+ 
+@@ -56,10 +60,12 @@ kfree(void *pa)
+ 
+   r = (struct run*)pa;
+ 
+-  acquire(&kmem.lock);
+-  r->next = kmem.freelist;
+-  kmem.freelist = r;
+-  release(&kmem.lock);
++  int id = r_tp();
++
++  acquire(&kmems[id].lock);
++  r->next = kmems[id].freelist;
++  kmems[id].freelist = r;
++  release(&kmems[id].lock);
+ }
+ 
+ // Allocate one 4096-byte page of physical memory.
+@@ -70,11 +76,29 @@ kalloc(void)
+ {
+   struct run *r;
+ 
+-  acquire(&kmem.lock);
+-  r = kmem.freelist;
++  int id = r_tp();
++
++  acquire(&kmems[id].lock);
++  r = kmems[id].freelist;
+   if(r)
+-    kmem.freelist = r->next;
+-  release(&kmem.lock);
++    kmems[id].freelist = r->next;
++  else 
++  {
++    for(int i=0;i<NCPU;i++)
++    {
++      if(kmems[i].freelist)
++      {
++        struct run* tmp = kmems[i].freelist;
++        kmems[i].freelist=kmems[i].freelist->next;
++        kmems[id].freelist = tmp;
++        tmp->next=0;
++        r = kmems[id].freelist;
++        kmems[id].freelist = r->next;
++        break;
++      }
++    }
++  }
++  release(&kmems[id].lock);
+ 
+   if(r)
+     memset((char*)r, 5, PGSIZE); // fill with junk
+diff --git a/kernel/spinlock.c b/kernel/spinlock.c
+index dd0ed53..c0cf450 100644
+--- a/kernel/spinlock.c
++++ b/kernel/spinlock.c
+@@ -46,6 +46,7 @@ findslot(struct spinlock *lk) {
+ void
+ initlock(struct spinlock *lk, char *name)
+ {
++  // printf("%s\n", name);
+   lk->name = name;
+   lk->locked = 0;
+   lk->cpu = 0;
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..45a4fb7
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++8

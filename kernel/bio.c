@@ -39,27 +39,22 @@ binit(void)
 {
   // printf("binit start\n");
   struct buf *b;
+  initlock(&bcache.global_lock, "bcache_global_lock");
   for(int i=0;i<NBUCKETS;i++)
   {
-    // printf("i=%d\n",i);
     initlock(&bcache.lock[i], "bcaches");
-    // printf("i=%d\n",i);
-
     bcache.hashbucket[i].prev = &bcache.hashbucket[i];
     bcache.hashbucket[i].next = &bcache.hashbucket[i];
-    
   }
 
   for(b = bcache.buf; b < bcache.buf+NBUF; b++)
   {
-
     b->next = bcache.hashbucket[b->blockno%NBUCKETS].next;
     b->prev = &bcache.hashbucket[b->blockno%NBUCKETS];
     initsleeplock(&b->lock, "buffers");
     bcache.hashbucket[b->blockno].next->prev = b;
     bcache.hashbucket[b->blockno].next = b;
   }
-
 }
 
 // Look through buffer cache for block on device dev.
@@ -70,11 +65,8 @@ bget(uint dev, uint blockno)
 {
   // printf("bget start\n");
   struct buf *b;
-
   int id = blockno % NBUCKETS;
-
   acquire(&bcache.lock[id]);
-
   // Is the block already cached?
   for(b = bcache.hashbucket[id].next; b != &bcache.hashbucket[id]; b = b->next){
     if(b->dev == dev && b->blockno == blockno){
@@ -84,7 +76,6 @@ bget(uint dev, uint blockno)
       return b;
     }
   }
-
   // Not cached.
   // Recycle the least recently used (LRU) unused buffer.
   for(b = bcache.hashbucket[id].prev; b != &bcache.hashbucket[id]; b = b->prev){
@@ -102,7 +93,6 @@ bget(uint dev, uint blockno)
   release(&bcache.lock[id]);
   acquire(&bcache.global_lock);
   acquire(&bcache.lock[id]);
-  // printf("hhh\n");
   for(int i=0;i<NBUCKETS;i++)
   {
     if(i==id)continue;

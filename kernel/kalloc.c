@@ -30,7 +30,6 @@ kinit()
   {
     initlock(&kmems[i].lock, "kmems");
   }
-  // initlock(&kmem.lock, "kmem");
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -81,24 +80,27 @@ kalloc(void)
   acquire(&kmems[id].lock);
   r = kmems[id].freelist;
   if(r)
+  {
     kmems[id].freelist = r->next;
+    release(&kmems[id].lock);
+  }
   else 
   {
+    release(&kmems[id].lock);
     for(int i=0;i<NCPU;i++)
     {
+      acquire(&kmems[i].lock);
       if(kmems[i].freelist)
       {
-        struct run* tmp = kmems[i].freelist;
+        r = kmems[i].freelist;
         kmems[i].freelist=kmems[i].freelist->next;
-        kmems[id].freelist = tmp;
-        tmp->next=0;
-        r = kmems[id].freelist;
-        kmems[id].freelist = r->next;
+        release(&kmems[i].lock);
         break;
       }
+      release(&kmems[i].lock);
     }
   }
-  release(&kmems[id].lock);
+  
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk

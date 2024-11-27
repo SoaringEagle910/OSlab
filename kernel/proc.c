@@ -35,8 +35,11 @@ void procinit(void) {
     char *pa = kalloc();
     if (pa == 0) panic("kalloc");
     uint64 va = KSTACK((int)(p - proc));
+    //需要保留内核栈在全局页表kernel_pagetable的映射，故注释掉xxxxx理解错了！！！是要有这行代码！！！
     kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
     p->kstack = va;
+    //把procinit()中内核栈的物理地址pa拷贝到PCB新增的成员kstack_pa中
+    p->kstack_pa = (uint64)pa;
   }
   kvminithart();
 }
@@ -110,6 +113,16 @@ found:
     release(&p->lock);
     return 0;
   }
+  p->k_pagetable = kvminit_independent();//创建内核页表
+  if(p->k_pagetable == 0){//调用失败！！不知道需不需要
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  // vmprint(p->k_pagetable);
+  //printf("page table %p\n", p->k_pagetable);
+  //将Step 3 设置的内核栈映射到页表k_pagetable里
+  kvmmap_indepenent(p->k_pagetable, p->kstack, p->kstack_pa, PGSIZE, PTE_W | PTE_R);
 
   // Set up new context to start executing at forkret,
   // which returns to user space.
@@ -118,6 +131,22 @@ found:
   p->context.sp = p->kstack + PGSIZE;
 
   return p;
+}
+
+void free_k_pg(pagetable_t pagetable) {
+  // there are 2^9 = 512 PTEs in a page table.
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+      // this PTE points to a lower-level page table.
+      uint64 child = PTE2PA(pte);
+      free_k_pg((pagetable_t)child);
+      pagetable[i] = 0;
+    } else if (pte & PTE_V) {//叶
+      pagetable[i] = 0;
+    }
+  }
+  kfree((void *)pagetable);
 }
 
 // free a proc structure and the data hanging from it,
@@ -136,6 +165,17 @@ static void freeproc(struct proc *p) {
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+
+  // 将内核页表的前96项置零，避免重复回收
+  pagetable_t pa = (pagetable_t)PTE2PA(p->k_pagetable[0]);
+  for (int i = 0; i < 96; i++) {
+    pa[i] = 0;
+  }
+
+  //百思不得其解，不知道哪里错了，直到发现是step6漏掉了，光顾着实现函数去了，没在这里调用函数，加了这一段代码，usertests过了
+  // 释放该进程的独立内核进程
+  if (p->k_pagetable) free_k_pg(p->k_pagetable);
+  p->k_pagetable = 0;
 }
 
 // Create a user page table for a given process,
@@ -202,6 +242,8 @@ void userinit(void) {
 
   p->state = RUNNABLE;
 
+  sync_pagetable(p->pagetable, p->k_pagetable);
+
   release(&p->lock);
 }
 
@@ -220,6 +262,7 @@ int growproc(int n) {
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
   p->sz = sz;
+  sync_pagetable(p->pagetable, p->k_pagetable);
   return 0;
 }
 
@@ -261,6 +304,8 @@ int fork(void) {
   pid = np->pid;
 
   np->state = RUNNABLE;
+
+  sync_pagetable(np->pagetable, np->k_pagetable);
 
   release(&np->lock);
 
@@ -430,7 +475,14 @@ void scheduler(void) {
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        //切换进程独立的内核页表,之后才切换上下文
+        w_satp(MAKE_SATP(p->k_pagetable));
+        sfence_vma();
+
         swtch(&c->context, &p->context);
+
+        //切换为全局内核页表
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
